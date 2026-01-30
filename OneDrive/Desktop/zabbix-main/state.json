@@ -1,0 +1,13 @@
+{
+  "last_run_utc": 1769732775,
+  "processed_findings": {
+    "summary_Zabbix server_3": "50",
+    "summary_Zabbix server_2": "15",
+    "summary_Zabbix server_4": "1",
+    "summary_Zabbix server_1": "7",
+    "24327": "0",
+    "summary_PA-440_3": "6",
+    "summary_PA-440_4": "2",
+    "summary_PA-440_1": "5"
+  }
+}

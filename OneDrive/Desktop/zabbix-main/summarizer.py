@@ -11,59 +11,159 @@ SEVERITY_LABEL = {
     5: "Disaster",
 }
 
-def _ts(ts: int) -> str:
-    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+SEVERITY_MAPPING = {
+    5: "disaster",
+    4: "high",
+    3: "average",
+    2: "warning",
+    1: "information",
+    0: "not_classified",
+}
 
-def summarize(hours_window: int, api_version: str, problems: List[Dict[str, Any]], events: List[Dict[str, Any]]) -> str:
-    sev_counts = Counter()
-    host_counts = Counter()
-    open_count = 0
-    ack_count = 0
+def summarize(scan_id: str, company_id: int, api_key: str, api_version: str, problems: List[Dict[str, Any]], events: List[Dict[str, Any]], all_hosts: List[Dict[str, Any]] = None, all_triggers: List[Dict[str, Any]] = None, state: Dict[str, Any] = None) -> Dict[str, Any]:
+    counts = Counter()
+    findings = []
+    all_hosts = all_hosts or []
+    all_triggers = all_triggers or []
+    state = state or {}
+    processed_findings = state.get("processed_findings", {})
+    new_findings_state = {}
 
-    for p in problems:
-        sev = int(p.get("severity", 0))
-        sev_counts[sev] += 1
+    # Mapear cuáles Triggers tienen problemas activos ahora mismo
+    active_trigger_ids = {p.get("objectid") for p in problems}
 
-        if int(p.get("r_clock") or 0) == 0:
-            open_count += 1
-        if int(p.get("acknowledged", 0)) == 1:
-            ack_count += 1
+    # Agrupar triggers por host para resumir
+    host_summary = {}
 
-        for h in (p.get("hosts") or []):
-            host_counts[h.get("name", "unknown")] += 1
+    # 1. Clasificación Inteligente
+    for t in all_triggers:
+        hosts = t.get("hosts") or []
+        host_name = hosts[0].get("name") if hosts else "Zabbix System"
+        trigger_id = t.get("triggerid")
+        is_active = trigger_id in active_trigger_ids
+        
+        # Extraer tags para decidir si es "especial"
+        tags = {tag.get("tag").lower(): tag.get("value") for tag in (t.get("tags") or [])}
+        has_custom_info = any(k in tags for k in ["cve", "cvss", "solution", "impact"])
 
-    top_hosts = host_counts.most_common(5)
-    now = int(datetime.now(timezone.utc).timestamp())
+        if host_name not in host_summary:
+            host_summary[host_name] = {"active_or_special": [], "healthy_count": 0, "ip": "N/A", "port": "0"}
+        
+        # Guardar IP/Puerto del host
+        interfaces = t.get("interfaces") or []
+        main_interface = next((i for i in interfaces if i.get("main") == "1"), interfaces[0]) if interfaces else {}
+        host_summary[host_name]["ip"] = main_interface.get("ip", "N/A")
+        host_summary[host_name]["port"] = main_interface.get("port", "0")
 
-    lines: List[str] = []
-    lines.append(f"# Resumen Zabbix (últimas {hours_window}h)")
-    lines.append(f"- Generado (UTC): **{_ts(now)}**")
-    lines.append(f"- API version: **{api_version}**")
-    lines.append("")
-    lines.append("## Salud general")
-    lines.append(f"- Problemas: **{len(problems)}**")
-    lines.append(f"- Abiertos (estimado): **{open_count}**")
-    lines.append(f"- Acknowledged: **{ack_count}**")
-    lines.append(f"- Eventos: **{len(events)}**")
-    lines.append("")
-    lines.append("## Severidad (problemas)")
-    if not sev_counts:
-        lines.append("- Sin problemas en el rango.")
-    else:
-        for sev in sorted(sev_counts.keys(), reverse=True):
-            lines.append(f"- {SEVERITY_LABEL.get(sev, str(sev))}: **{sev_counts[sev]}**")
-    lines.append("")
-    lines.append("## Top hosts (por problemas)")
-    if not top_hosts:
-        lines.append("- (sin datos)")
-    else:
-        for host, c in top_hosts:
-            lines.append(f"- {host}: **{c}**")
-    lines.append("")
-    lines.append("## Últimos 7 problemas")
-    for p in problems[:7]:
-        sev = int(p.get("severity", 0))
-        hosts = ", ".join([h.get("name", "unknown") for h in (p.get("hosts") or [])]) or "(sin host)"
-        lines.append(f"- [{SEVERITY_LABEL.get(sev, sev)}] {p.get('name','')} — {hosts} — {_ts(int(p.get('clock',0)))}")
+        # Si está activo O tiene info personalizada (CVE), lo mostramos individual
+        if is_active or has_custom_info:
+            host_summary[host_name]["active_or_special"].append(t)
+        else:
+            host_summary[host_name]["healthy_count"] += 1
 
-    return "\n".join(lines) + "\n"
+    # 2. Construir Findings (Prioridad: Datos reales de Zabbix)
+    for host_name, data in host_summary.items():
+        # A. ALERTAS ACTIVAS O REGLAS CON INFO ESPECIAL (CVE, etc.)
+        for t in data["active_or_special"]:
+            trigger_id = t.get("triggerid")
+            last_change = t.get("lastchange", "0")
+            fingerprint = f"{trigger_id}_{last_change}"
+            
+            is_active = trigger_id in active_trigger_ids
+            sev_num = int(t.get("priority", 0))
+            sev_label = SEVERITY_MAPPING.get(sev_num, "not_classified")
+            
+            if is_active:
+                counts[sev_label] += 1
+            
+            # Guardamos el estado actual para la próxima vez
+            new_findings_state[trigger_id] = last_change
+
+            # DELTA LOGIC: Solo enviamos si no ha sido procesado con este timestamp
+            if processed_findings.get(trigger_id) == last_change:
+                continue
+
+            tags = {tag.get("tag").lower(): tag.get("value") for tag in (t.get("tags") or [])}
+            description = t.get("description", "").replace("{HOST.NAME}", host_name)
+            
+            # Buscar CVE en tags o texto
+            cve_val = tags.get("cve", "INTERNAL-ZBX")
+            if cve_val == "INTERNAL-ZBX" and "CVE-" in description.upper():
+                import re
+                found = re.search(r'(CVE-\d{4}-\d+)', description, re.IGNORECASE)
+                if found: cve_val = found.group(1).upper()
+
+            findings.append({
+                "name": description,
+                "severity": sev_label, 
+                "cvss": float(tags.get("cvss", sev_num * 2.0 if sev_num > 0 else 1.0)),
+                "cve": cve_val,
+                "oid": f"zbx-trig-{t['triggerid']}",
+                "host": f"{host_name} ({data['ip']})",
+                "port": tags.get("port", data["port"] if data["port"] != "0" else "161"),
+                "protocol": tags.get("protocol", "snmp/agent"),
+                "description": f"{'🚨 ALERTA ACTIVA' if is_active else '✅ ESTADO OK'}: {description}",
+                "solution": tags.get("solution", "Acción requerida en consola Zabbix."),
+                "impact": tags.get("impact", "Monitoreo activo o recurso afectado.")
+            })
+
+        # B. RESUMEN DE REGLAS (Heartbeat de salud - Se cuenta globalmente pero no siempre se envía el finding)
+        displayed_ids = {t.get("triggerid") for t in data["active_or_special"]}
+        trigger_by_sev = Counter([int(t.get("priority", 0)) for t in all_triggers 
+                                 if t.get("triggerid") not in displayed_ids 
+                                 and (t.get("hosts") or [{}])[0].get("name") == host_name])
+        
+        for sev_num, count in trigger_by_sev.items():
+            if count == 0: continue
+            sev_label = SEVERITY_MAPPING.get(sev_num, "not_classified")
+            
+            # El resumen lo enviamos solo si cambia el conteo total por host
+            summary_id = f"summary_{host_name}_{sev_num}"
+            summary_val = str(count)
+            
+            if processed_findings.get(summary_id) != summary_val:
+                findings.append({
+                    "name": f"Rule Group ({sev_label}): {host_name}",
+                    "severity": sev_label,
+                    "cvss": float(sev_num * 1.5 if sev_num > 0 else 1.0),
+                    "cve": "N/A",
+                    "oid": f"zbx-chk-{host_name}-{sev_num}",
+                    "host": f"{host_name} ({data['ip']})",
+                    "port": data["port"] if data["port"] != "0" else "161",
+                    "protocol": "snmp/agent",
+                    "description": f"✅ Monitoreando con éxito {count} reglas de nivel {sev_label}.",
+                    "solution": "No se requiere acción, estado estable.",
+                    "impact": "Protección activa."
+                })
+            
+            new_findings_state[summary_id] = summary_val
+
+    scanned_at = datetime.now(timezone.utc).isoformat()
+    cvss_max = max([f["cvss"] for f in (findings if findings else [{"cvss": 0.0}])])
+    
+    report = {
+        "scan_id": scan_id,
+        "company_id": int(company_id),
+        "api_key": api_key,
+        "scanned_at": scanned_at,
+        "event_type": "vuln_scan_report",
+        "scanner_type": "zabbix", # Cambiado de 'scanner' a 'scanner_type'
+        "scan_summary": {
+            "scan_id": scan_id,
+            "scan_name": f"Zabbix Real-time Sync (v{api_version})",
+            "status": "completed",
+            "total_hosts": len(all_hosts),
+            "scanned_at": scanned_at,
+            "cvss_max": cvss_max,
+            "scanner_type": "zabbix", # Duplicado por seguridad
+            "disaster_count": counts["disaster"],
+            "high_count": counts["high"],
+            "average_count": counts["average"],
+            "warning_count": counts["warning"],
+            "information_count": counts["information"],
+            "not_classified_count": counts["not_classified"],
+        },
+        "findings": findings
+    }
+    
+    return report, new_findings_state
